@@ -1,0 +1,11 @@
+---
+title: "STAT 436 Project"
+subtitle: "Median list price: history, backtest and outlook"
+format: 
+  dashboard:
+    theme: 
+    scrolling: true
+---
+
+#{.sidebar}
+

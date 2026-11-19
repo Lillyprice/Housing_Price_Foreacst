@@ -1,0 +1,586 @@
+---
+title: "STAT436_Project01"
+format: pdf
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r}
+library(tidyverse)
+library(fpp3)
+library(forecast)
+library(patchwork)
+library(knitr)
+```
+
+
+# Data
+
+## Read, Format, & Sample
+
+```{r}
+# read in data
+raw <- read.csv("Metro_mlp_uc_sfrcondo_month.csv")
+raw <- raw[-1,]  # get rid of labels row
+# pivoted
+raw <- raw |> 
+  pivot_longer(
+    cols = -(1:5),
+    names_to = "Date",
+    values_to = "Value")
+# make date a date obj
+raw <- raw |> 
+  mutate(Date = ymd(substring(Date, first = 2))) |> 
+  mutate(Time = yearmonth(Date))
+
+# select some regions with no gaps
+sampNoGaps <- raw |> 
+  filter(RegionName %in% c(
+        "New York, NY", "Detroit, MI", "Dallas, TX", 
+        "Denver, CO", "Los Angeles, CA"
+      ))
+# put into a time series object
+ts5 <- sampNoGaps |> 
+  dplyr::select(-c(1, 2, 4, 5)) |> 
+  tsibble(key = RegionName, index = Time)
+
+# train/test split
+train5 <- ts5 |>  # 300 obs
+  filter(Time < yearmonth("2024 January")) |> 
+  dplyr::select(-Date)  # don't want to accidentally use
+test5 <- ts5 |>  # 225 obs
+  filter(Time >= yearmonth("2024 January")) |> 
+  dplyr::select(-Date)  # don't want to accidentally use
+```
+
+
+## Visualize
+
+```{r}
+# plot time series ----
+colors5 <- c(  # ordered color pallet
+    "firebrick",  # Dallas, TX
+    "olivedrab",  # Denver, CO
+    "goldenrod",  # Detroit, MI
+    "hotpink",    # Los Angeles, CA
+    "slateblue")  # New York, NY
+
+ts5 |> autoplot() +
+  scale_color_manual(values = colors5) +
+  theme_bw() +
+  labs(title = "Monthly Median Listing Price",
+       x = "Time (Month)",
+       y = "Median Price") +
+  geom_vline(aes(xintercept = yearmonth("2024 January")))
+
+# plot acfs of raw time series ----
+tx_acf <- ts5 |>  # Dallas, TX
+  filter(RegionName == "Dallas, TX") |> 
+  ACF(Value) |> 
+  autoplot() +
+  theme_bw() +
+  labs(title = "Dallas, TX",
+       x = "lag (Months)")
+co_acf <- ts5 |>  # Denver, CO   
+  filter(RegionName == "Denver, CO") |> 
+  ACF(Value) |> 
+  autoplot() +
+  theme_bw() +
+  labs(title = "Denver, CO",
+       x = "lag (Months)")
+mi_acf <- ts5 |>  # Detroit, MI   
+  filter(RegionName == "Detroit, MI") |> 
+  ACF(Value) |> 
+  autoplot() +
+  theme_bw() +
+  labs(title = "Detroit, MI",
+       x = "lag (Months)")
+ca_acf <- ts5 |>  # Los Angeles, CA   
+  filter(RegionName == "Los Angeles, CA") |> 
+  ACF(Value) |> 
+  autoplot() +
+  theme_bw() +
+  labs(title = "Los Angeles, CA",
+       x = "lag (Months)")
+ny_acf <- ts5 |>  # New York, NY  
+  filter(RegionName == "New York, NY") |> 
+  ACF(Value) |> 
+  autoplot() +
+  theme_bw() +
+  labs(title = "New York, NY",
+       x = "lag (Months)")
+
+(tx_acf + co_acf + mi_acf) / (ca_acf + ny_acf)
+```
+
+# Model Each Region Separately
+
+```{r}
+# create cross-validation training set
+cv_horizon <- 12  # how many steps to forecast for each fold
+cv_step <- 12  # how many obs to add to the next fold
+end_of_first_fold <- yearmonth("2021 Jan")  # date that the first fold ends 
+train5_cv <- train5 |>
+  stretch_tsibble(
+    .init = 36,  # number of months where the *first* fold ends (= 1st 2 cycles)
+                 # -> Jan 2021 = 36 months from Jan 2018 (first obs)
+    .step = cv_step) |>  # each later fold adds 12 months
+  filter(# last month of train data is Dec 2023, and we only keep folds with a 
+         # CV forecast horizon inside the train data (which ends at 72 months)
+    .id <= 3)  # folds with forecasts inside train set
+
+# create empty list to store each region's top model
+top_region_models <- c()
+
+
+# function that fits chosen models on the data passed
+fit_candidates <- function(data){
+  data |> model(  # fit the 16 potential models
+    # ETS ----
+    `ETS(M,A,A)`  = ETS(Value ~ error("M") + trend("A") + season("A")),
+    `ETS(M,A,M)`  = ETS(Value ~ error("M") + trend("A") + season("M")),
+    `ETS(A,A,M)`  = ETS(Value ~ error("A") + trend("A") + season("M")),
+    `ETS(A,Ad,M)` = ETS(Value ~ error("A") + trend("Ad") + season("M")),
+    `ETS(A,A,A)`  = ETS(Value ~ error("A") + trend("Ad") + season("A")),
+    `ETS(A,Ad,A)` = ETS(Value ~ error("A") + trend("Ad") + season("A")),
+    `ETS(M,Ad,M)` = ETS(Value ~ error("M") + trend("Ad") + season("M")),
+    # >> 7 ETS models
+
+    # DECOMPOSED ----
+    `STL(annual) + NAIVE` = decomposition_model(
+          STL(Value ~ trend() + season(period = 12), robust = TRUE), 
+          NAIVE(season_adjust)),
+    `STL(annual, no trend) + ETS(A,Ad,N)` = decomposition_model(
+          STL(Value ~ season(period = 12), robust = TRUE), 
+          ETS(season_adjust ~ error("A") + trend("Ad") + season("N"))),
+    `STL(annual, no trend) + ETS(M,Ad,N)` = decomposition_model(
+          STL(Value ~ season(period = 12), robust = TRUE), 
+          ETS(season_adjust ~ error("M") + trend("Ad") + season("N"))),
+    `STL(annual, no trend) + ARIMA(auto)` = decomposition_model(
+          STL(Value ~ season(period = 12), robust = TRUE),
+          ARIMA(season_adjust)),
+    # >> 4 decomposition models
+
+    # ARIMA ----
+    `ARIMA(auto)` = ARIMA(Value),
+    # >> 1 ARIMA model
+    
+    # BENCHMARK ----
+    `Mean (benchmark)`           = MEAN(Value),
+    `Naïve (benchmark)`          = NAIVE(Value),
+    `Seasonal Naïve (benchmark)` = SNAIVE(Value ~ lag("1 year")),
+    `Drift (benchmark)`          = RW(Value ~ drift())
+    # >> 4 benchmark models
+  )
+}
+
+
+# STEP 1 : fit models to an individual region using cross-validation
+regionCV <- function(region){
+  
+  # TRAINING SETS ----
+  # *cross-validation* training set for <region>
+  region_train_cv <- train5_cv |>  # cv set (with folds)
+    filter(RegionName == region) |> 
+    dplyr::select(-1)  # remove RegionName column
+  # *original* training set for <region>
+  region_train <- train5 |>  # original time series (no folds)
+    filter(RegionName == region) |> 
+    dplyr::select(-1)  # remove RegionName column
+  
+  # PART 1 : fit models ----
+  # apply time series cross-validation to training set
+  region_cv_fits <- region_train_cv |>
+    fit_candidates() |>  # fit all potential models
+    forecast(h = cv_horizon)  # forecast each fold
+  
+  # PARTS 2 & 3 : diagnostics & model comparison ----
+  # get accuracy measures for models across each fold
+  cv_origin <- region_cv_fits |>  # (one row per model per fold)
+    accuracy(region_train,  # use original training set (not CV set) for comparison
+             by = c(".model", ".id")) |>  # scales each fold's MASE by that fold's own training data
+    mutate(origin = end_of_first_fold + cv_step * (.id - 1))
+  
+  # > Measure 1 : How often is each model the best at a forecast origin?
+  wins <- cv_origin |>  
+    group_by(.id) |>  # group by fold
+    slice_min(MASE, n = 1,  # select the model with the smallest MASE
+              with_ties = TRUE) |>  # ties kept together (n may be > 1)
+    ungroup() |>  # ungroup by fold
+    count(.model,  # count times each model had smallest MASE (across all folds)
+          name = "origins_won")
+  
+  wins_and_measures <- cv_origin |>
+    group_by(.model) |>  # group by model
+    summarize(cv_MASE = mean(MASE),  # get MASE for each model (all folds)
+              cv_RMSE = mean(RMSE),  # get RMSE for each model (all folds)
+              .groups = "drop") |>   # drop grouping for result
+    left_join(wins, by = ".model") |>  # meld wins, MASE, & RMSE of each model
+    mutate(origins_won = coalesce(origins_won,0L)) |>  # first non-missing value 
+    arrange(cv_MASE)  # sort by MASE
+  
+  # > Measure 2 : Which models are consistently better?
+  colorfunc_benchmark <- colorRampPalette(  # benchmark models: yellow -> orange
+    c("gold", "orange", "sienna2"))  # (4 total)
+  colorfunc_ETS <- colorRampPalette(  # ETS models: green -> blue
+    c("forestgreen", "springgreen2", "turquoise", "deepskyblue2", "dodgerblue4"))  # (7 total)
+  colorfunc_decomposition <- colorRampPalette(  # decomp models: pink -> purple
+    c("pink2", "hotpink1", "violetred3", "darkmagenta", "purple4"))  # (6 total)
+  model_colors <- c(  # ordered color pallet 
+      "firebrick3",                 # ARIMA
+      colorfunc_benchmark(4)[1],    # drift (benchmarks)
+      colorfunc_ETS(7),             # ETS models
+      colorfunc_benchmark(4)[2:4],  # mean, naïve, snaïve (benchmarks)
+      colorfunc_decomposition(6)    # decomposition models
+  )
+  consistency_plot <- cv_origin |>  # RETURNED
+    ggplot(aes(as.Date(origin), MASE, colour = .model, group = .model)) +
+    geom_line() + 
+    geom_point() +
+    labs(title = region,
+         subtitle = "Cross-Validation MASE At Each Forecast Origin",
+         x = "Forecast Origin", 
+         color = NULL) + 
+    scale_color_manual(values = model_colors) +
+    theme_bw()
+  
+  # > Measure 3 : Ljung-Box Test
+  lb <- augment(fit_candidates(region_train)) |>  # use fitted original training set (not CV set)
+    features(.innov, ljung_box, lag = 24) |>
+    mutate(passes = lb_pvalue > 0.05) |>
+    arrange(desc(lb_pvalue))
+  selection_info <- wins_and_measures |>  # RETURNED
+    left_join(lb |> select(.model, lb_pvalue, passes), by = ".model") |>  # adds LB to accuracy info
+    arrange(cv_MASE)
+  
+  # select the top model based on CV
+  chosen_model <- selection_info |>  # RETURNED
+    filter(passes) |>  # only models that pass Ljung-Box test
+    slice(1) |>  # ordered by MASE, so 1st model has lowest MASE
+    pull(.model)  # retrieve the model name
+  
+  
+  # RETURNED
+  return ( list(
+    "consistency" = consistency_plot,  # model consistency plot
+    "accuracy" = selection_info,       # CV accuracy measures and LB test results
+    "chosen" = chosen_model )          # model with lowest MASE that also passes LB test
+  )
+}
+
+
+# function to create model diagnostics for a given region and set of models
+model_diagnostics <- function(region, models){
+  
+  # *original* training set for <region>
+  region_train <- train5 |>  # original time series (no folds)
+    filter(RegionName == region) |> 
+    dplyr::select(-1)  # remove RegionName column
+  # fit models on *original* training data
+  region_OGtrain_fits <- fit_candidates(region_train)
+  
+  # > Measure 4 : Model Diagnostics (last resort)
+  for (m in models) {  # go through all models
+    print(region_OGtrain_fits |>  # use fitted original training set (not CV set)
+            dplyr::select(all_of(m)) |>  # select data fitted to model m
+            gg_tsresiduals() +  # time series diagnostic plots
+            labs(title = m,
+                 subtitle = region) +
+            theme_bw())
+  }
+  
+} 
+```
+
+### Dallas, TX
+
+```{r}
+# preform CV on Dallas, TX training data for all potential models
+TX_CV_output <- regionCV("Dallas, TX") 
+
+# extract CV results
+TX_consistency_plot <- TX_CV_output$consistency  # consistency plot
+TX_accuracy <- TX_CV_output$accuracy             # CV accuracy measures and LB test results
+TX_chosen_model <- TX_CV_output$chosen           # model with lowest MASE that also passes LB test
+
+# display results
+kable(TX_accuracy, digits = 2)  # model accuracy measures (table)
+TX_consistency_plot  # model performance across origins (plot)
+
+# look at diagnostics of close models
+TX_close_models <- c("ARIMA(auto)", 
+                     "STL(annual, no trend) + ETS(A,Ad,N)", 
+                     "STL(annual, no trend) + ETS(M,Ad,N)")
+model_diagnostics("Dallas, TX", TX_close_models)
+
+# determine Dallas, TX top model
+# > we agree with the auto-selected top model (ARIMA(auto)) because it has the 
+#   lowest MASE (by ~0.4), passes LB, has the lowest RMSE by a good bit, and 
+#   consistently has the lowest MASE across origins
+top_region_models <- c(top_region_models, TX_chosen_model)  # ARIMA(auto)
+```
+
+### Denver, CO
+
+```{r}
+# preform CV on Denver, CO training data for all potential models
+CO_CV_output <- regionCV("Denver, CO") 
+
+# extract CV results
+CO_consistency_plot <- CO_CV_output$consistency  # consistency plot
+CO_accuracy <- CO_CV_output$accuracy             # CV accuracy measures and LB test results
+CO_chosen_model <- CO_CV_output$chosen           # model with lowest MASE that also passes LB test
+
+# display results
+kable(CO_accuracy, digits = 2)  # model accuracy measures (table)
+CO_consistency_plot  # model performance across origins (plot)
+
+# look at diagnostics of close models
+CO_close_models <- c("ETS(M,Ad,M)", "ETS(M,A,A)", "ETS(A,Ad,M)")
+model_diagnostics("Denver, CO", CO_close_models)
+
+# determine Denver, CO top model
+# > [reasoning]
+CO_chosen_model <- "ETS(M,A,A)"  # change the chosen model from auto-selected model
+top_region_models <- c(top_region_models, CO_chosen_model)  # ETS(M,A,A)
+```
+
+### Detroit, MI
+
+```{r}
+# preform CV on Detroit, MI training data for all potential models
+MI_CV_output <- regionCV("Detroit, MI") 
+
+# extract CV results
+MI_consistency_plot <- MI_CV_output$consistency  # consistency plot
+MI_accuracy <- MI_CV_output$accuracy             # CV accuracy measures and LB test results
+MI_chosen_model <- MI_CV_output$chosen           # model with lowest MASE that also passes LB test
+
+# display results
+kable(MI_accuracy, digits = 2)  # model accuracy measures (table)
+MI_consistency_plot  # model performance across origins (plot)
+
+# look at diagnostics of close models
+MI_close_models <- c("ETS(M,A,A)")  # just top
+model_diagnostics("Detroit, MI", MI_close_models)
+
+# determine Detroit, MI top model
+# > [reasoning]
+#top_region_models <- c(top_region_models, MI_chosen_model)  # ETS(M,A,A)
+# >> same as one before
+```
+
+### Los Angeles, CA
+
+```{r}
+# preform CV on Los Angeles, CA training data for all potential models
+CA_CV_output <- regionCV("Los Angeles, CA") 
+
+# extract CV results
+CA_consistency_plot <- CA_CV_output$consistency  # consistency plot
+CA_accuracy <- CA_CV_output$accuracy             # CV accuracy measures and LB test results
+CA_chosen_model <- CA_CV_output$chosen           # model with lowest MASE that also passes LB test
+
+# display results
+kable(CA_accuracy, digits = 2)  # model accuracy measures (table)
+CA_consistency_plot  # model performance across origins (plot)
+
+# look at diagnostics of close models
+CA_close_models <- c("ETS(A,A,M)", "ETS(M,A,M)",  # do not pass LB
+                     "STL(annual) + NAIVE", "STL(annual, no trend) + ARIMA(auto)")  # do pass LB
+model_diagnostics("Los Angeles, CA", CA_close_models)
+
+# determine Los Angeles, CA top model
+# > [reasoning]
+#CA_chosen_model <- ???  # if we disagree with the auto-selected model, change the chosen model here
+top_region_models <- c(top_region_models, CA_chosen_model)  # [model]
+```
+
+### New York, NY
+
+```{r}
+# preform CV on New York, NY training data for all potential models
+NY_CV_output <- regionCV("New York, NY") 
+
+# extract CV results
+NY_consistency_plot <- NY_CV_output$consistency  # consistency plot
+NY_accuracy <- NY_CV_output$accuracy             # CV accuracy measures and LB test results
+NY_chosen_model <- NY_CV_output$chosen           # model with lowest MASE that also passes LB test
+
+# display results
+kable(NY_accuracy, digits = 2)  # model accuracy measures (table)
+NY_consistency_plot  # model performance across origins (plot)
+
+# look at diagnostics of close models
+#NY_close_models <- c(???)
+model_diagnostics("New York, NY", NY_chosen_model)
+
+# determine New York, NY top model
+# > [reasoning]
+#NY_chosen_model <- ???  # if we disagree with the auto-selected model, change the chosen model here
+#top_region_models <- c(top_region_models, NY_chosen_model)  # [model]
+# >> same as one above
+```
+
+
+# Determine Overall Best Model (Top Performing Across All Regions)
+
+```{r}
+# make a list of each region's CV accuracy measures
+region_accuracy <- list(`Dallas, TX` = TX_accuracy, 
+                        `Denver, CO` = CO_accuracy, 
+                        `Detroit, MI` = MI_accuracy, 
+                        `Los Angeles, CA` = CA_accuracy, 
+                        `New York, NY` = NY_accuracy )
+
+# for each region, pull out the accuracy measures and display diagnostics of the top region models
+for(r in attributes(region_accuracy)$names){
+  # model accuracy measures
+  print(
+    region_accuracy[[r]] |> 
+      filter(.model %in% top_region_models) |> 
+      arrange(cv_MASE) |> 
+      kable(caption = r)
+    )
+  # model diagnostics plot
+  model_diagnostics(r, top_region_models) 
+}
+
+# keep track of ranks and if Ljung-Box test was passed
+MASE_ranks <- data.frame(
+  `ETS(M,A,A)`          = c(2, 1, 1, 2, 1),
+  `ARIMA(auto)`         = c(1, 2, 3, 3, 3),
+  `STL(annual) + NAIVE` = c(3, 3, 2, 1, 2)
+) |> t()
+LB_passed <- data.frame(
+  `ETS(M,A,A)`          = c(0, 1, 1, 0, 1),
+  `ARIMA(auto)`         = c(1, 1, 1, 1, 1),
+  `STL(annual) + NAIVE` = c(1, 1, 1, 1, 1)
+) |> t()
+
+# display average MASE rank and proportion of LB tests passed
+kable(matrix( c(
+  mean(MASE_ranks[1,]), mean(LB_passed[1,]),    # ETS(M,A,A)
+  mean(MASE_ranks[2,]), mean(LB_passed[2,]),    # ARIMA(auto)
+  mean(MASE_ranks[3,]), mean(LB_passed[3,])),   # STL(annual) + NAIVE
+  nrow = 2, ncol = 3,
+  dimnames = list(c("Average MASE Rank", "Proportion of Ljung-Box Tests Passed"),  # rows (measures)
+                    c("ETS(M,A,A)", "ARIMA(auto)", "STL(annual) + NAIVE") )))  # columns (models)
+
+# determine best performing model across all regions
+# > [reasoning]
+top_overall_model <- 
+
+```
+
+
+# Forecast & Evaluate 
+
+```{r}
+# make forecasts for each region using the top overall model
+# ??? make function for this ???
+forecast_horizon <- 5*12  # how many months to forecast
+```
+
+```{r}
+# fit once on the training data, no saved objects before  
+stl_naive_fit <- train5 |> model(
+  `STL(annual) + NAIVE` = decomposition_model(
+    STL(Value ~ trend() + season(period = 12), robust = TRUE),
+    NAIVE(season_adjust))
+)
+
+# forecast the test months and evaluate
+stl_naive_fc <- stl_naive_fit |> forecast(new_data = test5)
+
+stl_naive_acc <- stl_naive_fc |>
+  accuracy(ts5, measures = list(RMSE = RMSE, MAE = MAE, MAPE = MAPE, MASE = MASE))
+
+kable(stl_naive_acc, digits = 3)
+
+stl_naive_fc |>
+  autoplot(ts5 |> filter(Time >= yearmonth("2021 Jan")), level = 95) +
+  facet_wrap(~RegionName, scales = "free_y", ncol = 2) +
+  theme_bw()
+
+
+```
+
+# Refit series on all data and forecast
+```{r}
+# refit 
+stl_Naive_full <- ts5 |> dplyr::select(-Date) |> model(
+  `STL(annual) + NAIVE` = decomposition_model(
+    STL(Value ~ trend() + season(period = 12), robust = TRUE),
+    NAIVE(season_adjust))
+)
+
+# forecast 5 years (60 months)
+futrue_fc <- stl_Naive_full |> forecast(h = forecast_horizon)
+
+
+futrue_fc |>
+  autoplot(ts5 |> filter(Time >= yearmonth("2021 Jan")), level = 95) +
+  facet_wrap(~RegionName, scale = "free_y", ncol = 2) +
+  labs(title = "STL(annual) + NAIVE: 5-Year Forecast",
+       x = "Time (Month)", y = "Median Price")
+```
+
+
+
+
+
+
+
+
+
+# Archived Code
+
+```{r}
+colors5 <- data.frame(  # region color pallet
+     `Dallas, TX`      = "firebrick", 
+     `Denver, CO`      = "olivedrab", 
+     `Detroit, MI`     = "goldenrod", 
+     `Los Angeles, CA` = "hotpink", 
+     `New York, NY`    = "slateblue") 
+```
+
+```{r}
+# time series for Dallas, TX (training)
+TX_train <- train5_cv |> 
+  filter(RegionName == "Dallas, TX") |> 
+  dplyr::select(-1)
+
+# PART 1 : fit models
+TX_cv_fits <- TX_train |>
+  fit_candidates()
+
+TX_cv_fits |>  # one row per model per fold
+  accuracy(TX_train,  # scales each fold's MASE by that fold's own training data
+           by = c(".model", ".id")) |>  
+  mutate(origin = yearmonth("2020 Jan") + 12 * (.id - 1))  
+
+# PART 2 : model diagnostics
+
+# > Ljung-Box : tests for autocorrelation in residuals (want high p-value)
+TX_lb <- augment(TX_fits) |>
+  features(.innov, ljung_box, lag = 24) |>
+  mutate(passes = lb_pvalue > 0.05) |>
+  arrange(desc(lb_pvalue))
+TX_lb
+
+for (m in colnames(TX_fits)) {
+  print(TX_fits |> dplyr::select(all_of(m)) |> gg_tsresiduals() + labs(title = m))
+}
+
+# PART 3 : compare models
+
+TX_fits |> forecast(h = 72) |> autoplot() + 
+  theme_bw() + 
+  facet_wrap(~`.model`) +
+  geom_line(aes(x = Time, y = Value), data = test5 |> filter(RegionName == "Dallas, TX") |> dplyr::select(-1))  # augment()
+
+# FINAL MODEL
+#dallasTX_top <- 
+```
